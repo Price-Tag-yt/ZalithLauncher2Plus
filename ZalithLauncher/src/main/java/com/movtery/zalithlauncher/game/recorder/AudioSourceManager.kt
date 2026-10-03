@@ -31,311 +31,271 @@ import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
 
-private const val TAG = "AudioSourceManager"
-internal const val AUDIO_SAMPLE_RATE = 48_000
-internal const val AUDIO_CHANNELS = 2
-internal const val BYTES_PER_FRAME = 2 * AUDIO_CHANNELS
+private const val TAG_AUDIO = "AudioSourceManager"
 
-/**
- * AudioSourceManager - Gère les deux sources audio (jeu + microphone) avec détection intelligente
- * 
- * Fonctionnalités:
- * - Capture audio interne via AudioPlaybackCapture (Android 11+)
- * - Capture microphone via AudioRecord(MIC)
- * - Fallback automatique si une source échoue
- * - Logging diagnostique complet
- * - Gestion des permissions
- * - Synchronisation des buffers PCM
- * - Mixing stéréo avec gains indépendants
- */
+internal const val REC_AUDIO_SAMPLE_RATE = 48_000
+internal const val REC_AUDIO_CHANNELS = 2
+internal const val REC_BYTES_PER_FRAME = 2 * REC_AUDIO_CHANNELS
+
 class AudioSourceManager(
     private val context: Context,
     private val projection: MediaProjection?
 ) {
-    
-    // === Audio Records ===
     var gameAudioRecord: AudioRecord? = null
     var microphoneAudioRecord: AudioRecord? = null
-    
-    // === État de capture ===
-    private var gameAudioAvailable = false
-    private var microphoneAvailable = false
+
     private var gameAudioStarted = false
     private var microphoneStarted = false
-    
-    // === Capacités détectées ===
+
     var supportsAudioPlaybackCapture = false
         private set
     var supportsMicrophoneCapture = false
         private set
-    
+
     init {
         supportsAudioPlaybackCapture = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
-        Log.i(TAG, "AudioSourceManager initialized - AudioPlaybackCapture support: $supportsAudioPlaybackCapture")
     }
-    
-    /**
-     * Initialise les deux sources audio avec détection intelligente
-     */
+
     fun initialize(): Boolean {
-        Log.i(TAG, "═══════════════════════════════════════════════════════════")
-        Log.i(TAG, "INITIALIZING AUDIO SOURCES")
-        Log.i(TAG, "═══════════════════════════════════════════════════════════")
-        
-        var successCount = 0
-        
-        // Tentative 1: Audio interne via AudioPlaybackCapture
+        Log.i(TAG_AUDIO, "=== Initialize audio sources ===")
+
         if (supportsAudioPlaybackCapture && projection != null) {
-            Log.i(TAG, "Attempting to initialize game audio via AudioPlaybackCapture...")
-            if (initializeGameAudio(projection)) {
-                gameAudioAvailable = true
-                successCount++
-                Log.i(TAG, "✓ Game audio (AudioPlaybackCapture) initialized successfully")
-            } else {
-                Log.w(TAG, "⚠ Game audio initialization failed, will use microphone only")
+            Log.i(TAG_AUDIO, "Trying game audio via AudioPlaybackCapture")
+            if (!initializeGameAudio()) {
+                Log.w(TAG_AUDIO, "Game audio init failed; continuing with microphone fallback")
             }
         } else {
-            Log.w(TAG, "⚠ AudioPlaybackCapture not available on this device (requires Android 11+) or projection is null")
+            Log.w(TAG_AUDIO, "AudioPlaybackCapture unavailable or projection null")
         }
-        
-        // Tentative 2: Microphone
-        Log.i(TAG, "Attempting to initialize microphone audio...")
+
         if (initializeMicrophone()) {
-            microphoneAvailable = true
             supportsMicrophoneCapture = true
-            successCount++
-            Log.i(TAG, "✓ Microphone audio initialized successfully")
+            Log.i(TAG_AUDIO, "Microphone capture ready")
         } else {
-            Log.w(TAG, "⚠ Microphone initialization failed")
+            Log.w(TAG_AUDIO, "Microphone capture unavailable")
         }
-        
-        if (successCount == 0) {
-            Log.e(TAG, "FATAL: No audio sources available!")
-            return false
-        }
-        
-        Log.i(TAG, "═══════════════════════════════════════════════════════════")
-        Log.i(TAG, "Audio sources ready: game=$gameAudioAvailable, mic=$microphoneAvailable")
-        Log.i(TAG, "═══════════════════════════════════════════════════════════")
-        
-        return true
+
+        val ready = gameAudioRecord != null || microphoneAudioRecord != null
+        Log.i(TAG_AUDIO, "=== Audio sources ready: game=${gameAudioRecord != null}, mic=${microphoneAudioRecord != null} ===")
+        return ready
     }
-    
-    /**
-     * Initialise la capture audio interne du jeu via AudioPlaybackCapture
-     */
-    private fun initializeGameAudio(projection: MediaProjection): Boolean {
+
+    private fun initializeGameAudio(): Boolean {
+        if (projection == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+
         return try {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-                Log.w(TAG, "AudioPlaybackCapture requires Android 11 (API 30+)")
-                return false
-            }
-            
-            val audioPlaybackCfg = AudioPlaybackCaptureConfiguration.Builder(projection)
+            val captureConfig = AudioPlaybackCaptureConfiguration.Builder(projection)
                 .addMatchingUsage(AudioAttributes.USAGE_GAME)
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                 .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
                 .build()
-            
-            val minBufferSize = AudioRecord.getMinBufferSize(
-                AUDIO_SAMPLE_RATE,
+
+            val audioFormat = AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(REC_AUDIO_SAMPLE_RATE)
+                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                .build()
+
+            val bufferSize = AudioRecord.getMinBufferSize(
+                REC_AUDIO_SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_STEREO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            val bufferSize = (minBufferSize * 2).coerceAtLeast(8192)
-            
+                .coerceAtLeast(8192) * 2
+
             gameAudioRecord = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val cfg = AudioRecord.AudioRecordingConfiguration.Builder()
-                    .setAudioPlaybackCaptureConfig(audioPlaybackCfg)
+                AudioRecord.Builder()
+                    .setAudioFormat(audioFormat)
+                    .setBufferSizeInBytes(bufferSize)
+                    .setAudioPlaybackCaptureConfig(captureConfig)
                     .build()
-                AudioRecord(cfg)
             } else {
-                // Fallback pour Android 11
-                AudioRecord(
-                    MediaRecorder.AudioSource.REMOTE_SUBMIX,
-                    AUDIO_SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_STEREO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize
-                )
+                AudioRecord.Builder()
+                    .setAudioFormat(audioFormat)
+                    .setBufferSizeInBytes(bufferSize)
+                    .setAudioPlaybackCaptureConfig(captureConfig)
+                    .build()
             }
-            
-            Log.d(TAG, "Game audio record created: bufferSize=$bufferSize bytes")
+
+            Log.i(TAG_AUDIO, "Game audio record created successfully (buffer=$bufferSize)")
             true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to create game audio record: ${e.message}", e)
+            Log.e(TAG_AUDIO, "Failed to create game audio record: ${e.message}", e)
             gameAudioRecord?.release()
             gameAudioRecord = null
             false
         }
     }
-    
-    /**
-     * Initialise la capture microphone
-     */
+
     private fun initializeMicrophone(): Boolean {
+        if (ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.w(TAG_AUDIO, "RECORD_AUDIO permission missing")
+            return false
+        }
+
         return try {
-            // Vérifier la permission
-            if (ContextCompat.checkSelfPermission(
-                    context,
-                    Manifest.permission.RECORD_AUDIO
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                Log.w(TAG, "⚠ RECORD_AUDIO permission not granted")
-                return false
-            }
-            
-            val minBufferSize = AudioRecord.getMinBufferSize(
-                AUDIO_SAMPLE_RATE,
+            val bufferSize = AudioRecord.getMinBufferSize(
+                REC_AUDIO_SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_STEREO,
                 AudioFormat.ENCODING_PCM_16BIT
-            )
-            val bufferSize = (minBufferSize * 2).coerceAtLeast(8192)
-            
+            ).coerceAtLeast(8192) * 2
+
             microphoneAudioRecord = AudioRecord(
                 MediaRecorder.AudioSource.MIC,
-                AUDIO_SAMPLE_RATE,
+                REC_AUDIO_SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_STEREO,
                 AudioFormat.ENCODING_PCM_16BIT,
                 bufferSize
             )
-            
-            Log.d(TAG, "Microphone audio record created: bufferSize=$bufferSize bytes")
+
+            Log.i(TAG_AUDIO, "Microphone record created successfully (buffer=$bufferSize)")
             true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to create microphone record: ${e.message}", e)
+            Log.e(TAG_AUDIO, "Failed to create microphone record: ${e.message}", e)
             microphoneAudioRecord?.release()
             microphoneAudioRecord = null
             false
         }
     }
-    
-    /**
-     * Démarre les deux sources audio
-     */
+
     fun startRecording(): Boolean {
-        Log.i(TAG, "Starting audio capture...")
-        
-        try {
-            gameAudioRecord?.apply {
-                if (recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                    startRecording()
+        var started = false
+
+        if (gameAudioRecord != null) {
+            try {
+                if (gameAudioRecord!!.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                    gameAudioRecord!!.startRecording()
                     gameAudioStarted = true
-                    Log.d(TAG, "Game audio recording started")
+                    Log.i(TAG_AUDIO, "Game internal audio started")
                 }
+                started = true
+            } catch (e: Exception) {
+                Log.e(TAG_AUDIO, "Failed to start game audio: ${e.message}", e)
+                gameAudioStarted = false
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start game audio: ${e.message}", e)
-            gameAudioStarted = false
         }
-        
-        try {
-            microphoneAudioRecord?.apply {
-                if (recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                    startRecording()
+
+        if (microphoneAudioRecord != null) {
+            try {
+                if (microphoneAudioRecord!!.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                    microphoneAudioRecord!!.startRecording()
                     microphoneStarted = true
-                    Log.d(TAG, "Microphone recording started")
+                    Log.i(TAG_AUDIO, "Microphone started")
                 }
+                started = true
+            } catch (e: Exception) {
+                Log.e(TAG_AUDIO, "Failed to start microphone: ${e.message}", e)
+                microphoneStarted = false
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start microphone: ${e.message}", e)
-            microphoneStarted = false
         }
-        
-        return gameAudioStarted || microphoneStarted
+
+        return started
     }
-    
-    /**
-     * Arrête les deux sources audio
-     */
+
     fun stopRecording() {
-        Log.i(TAG, "Stopping audio capture...")
-        
         try {
-            gameAudioRecord?.apply {
-                if (recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                    stop()
-                }
+            if (gameAudioRecord != null && gameAudioRecord!!.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                gameAudioRecord!!.stop()
             }
-            gameAudioStarted = false
-        } catch (e: Exception) {
-            Log.w(TAG, "Error stopping game audio: ${e.message}")
-        }
-        
+        } catch (_: Exception) {}
+        gameAudioStarted = false
+
         try {
-            microphoneAudioRecord?.apply {
-                if (recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                    stop()
-                }
+            if (microphoneAudioRecord != null && microphoneAudioRecord!!.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                microphoneAudioRecord!!.stop()
             }
-            microphoneStarted = false
-        } catch (e: Exception) {
-            Log.w(TAG, "Error stopping microphone: ${e.message}")
-        }
+        } catch (_: Exception) {}
+        microphoneStarted = false
     }
-    
-    /**
-     * Lit les données audio du jeu
-     */
-    fun readGameAudio(buffer: ByteArray, offset: Int, size: Int): Int {
-        return try {
-            gameAudioRecord?.read(buffer, offset, size) ?: 0
-        } catch (e: Exception) {
-            Log.w(TAG, "Error reading game audio: ${e.message}")
-            0
-        }
-    }
-    
-    /**
-     * Lit les données audio du microphone avec mode compatible
-     */
-    fun readMicrophoneAudio(buffer: ByteArray, offset: Int, size: Int): Int {
-        return try {
-            val record = microphoneAudioRecord ?: return 0
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                record.read(buffer, offset, size, AudioRecord.READ_BLOCKING)
-            } else {
-                @Suppress("DEPRECATION")
-                record.read(buffer, offset, size, AudioRecord.READ_NON_BLOCKING)
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Error reading microphone audio: ${e.message}")
-            0
-        }
-    }
-    
-    /**
-     * Libère toutes les ressources
-     */
+
     fun release() {
-        Log.i(TAG, "Releasing audio resources...")
-        
-        try {
-            gameAudioRecord?.stop()
-        } catch (_: Exception) {}
-        try {
-            gameAudioRecord?.release()
-        } catch (_: Exception) {}
+        Log.i(TAG_AUDIO, "Release audio resources")
+        stopRecording()
+        try { gameAudioRecord?.release() } catch (_: Exception) {}
         gameAudioRecord = null
-        
-        try {
-            microphoneAudioRecord?.stop()
-        } catch (_: Exception) {}
-        try {
-            microphoneAudioRecord?.release()
-        } catch (_: Exception) {}
+        try { microphoneAudioRecord?.release() } catch (_: Exception) {}
         microphoneAudioRecord = null
-        
         gameAudioStarted = false
         microphoneStarted = false
-        
-        Log.i(TAG, "Audio resources released")
     }
-    
-    /**
-     * Vérifie si une source est actuellement active
-     */
-    fun isGameAudioActive(): Boolean = gameAudioStarted && gameAudioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING
-    fun isMicrophoneActive(): Boolean = microphoneStarted && microphoneAudioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING
-    fun isAnyAudioActive(): Boolean = isGameAudioActive() || isMicrophoneActive()
+
+    fun readGameAudio(buffer: ByteArray, offset: Int, size: Int): Int {
+        if (gameAudioRecord == null) return 0
+        return try {
+            gameAudioRecord!!.read(buffer, offset, size)
+        } catch (e: Exception) {
+            Log.w(TAG_AUDIO, "Game audio read failed: ${e.message}")
+            0
+        }
+    }
+
+    fun readMicrophoneAudio(buffer: ByteArray, offset: Int, size: Int): Int {
+        if (microphoneAudioRecord == null) return 0
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                microphoneAudioRecord!!.read(buffer, offset, size, AudioRecord.READ_BLOCKING)
+            } else {
+                @Suppress("DEPRECATION")
+                microphoneAudioRecord!!.read(buffer, offset, size, AudioRecord.READ_NON_BLOCKING)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG_AUDIO, "Microphone read failed: ${e.message}")
+            0
+        }
+    }
+
+    fun isGameAudioActive(): Boolean =
+        gameAudioRecord != null && gameAudioRecord!!.recordingState == AudioRecord.RECORDSTATE_RECORDING
+
+    fun isMicrophoneActive(): Boolean =
+        microphoneAudioRecord != null && microphoneAudioRecord!!.recordingState == AudioRecord.RECORDSTATE_RECORDING
+
+    fun hasAnyAudio(): Boolean = gameAudioRecord != null || microphoneAudioRecord != null
+
+    fun mixPcm16Stereo(
+        gameBytes: ByteArray,
+        micBytes: ByteArray,
+        gameLen: Int,
+        micLen: Int,
+        out: ByteArray,
+        outOffset: Int,
+        gameGain: Float = 0.9f,
+        micGain: Float = 1.3f
+    ) {
+        val safeLen = minOf(gameLen, micLen)
+        var i = 0
+        var outIndex = outOffset
+
+        while (i + 1 < safeLen) {
+            val gameSample = readInt16LE(gameBytes, i)
+            val micSample = readInt16LE(micBytes, i)
+            val mixed = ((gameSample.toFloat() * gameGain) + (micSample.toFloat() * micGain))
+                .coerceIn(-32768f, 32767f)
+                .toInt()
+            writeInt16LE(out, outIndex, mixed)
+            i += 2
+            outIndex += 2
+        }
+
+        if (gameLen > 0 && micLen == 0) {
+            System.arraycopy(gameBytes, 0, out, outOffset, gameLen.coerceAtMost(out.size - outOffset))
+        } else if (micLen > 0 && gameLen == 0) {
+            System.arraycopy(micBytes, 0, out, outOffset, micLen.coerceAtMost(out.size - outOffset))
+        }
+    }
+
+    private fun readInt16LE(buf: ByteArray, offset: Int): Int {
+        val lo = buf[offset].toInt() and 0xFF
+        val hi = buf[offset + 1].toInt() and 0xFF
+        return (hi shl 8) or lo
+    }
+
+    private fun writeInt16LE(buf: ByteArray, offset: Int, value: Int) {
+        buf[offset] = (value and 0xFF).toByte()
+        buf[offset + 1] = ((value ushr 8) and 0xFF).toByte()
+    }
 }
